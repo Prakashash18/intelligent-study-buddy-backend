@@ -1,0 +1,6 @@
+build:
+  docker:
+    web: Dockerfile
+# run:
+#   web: docker run -d -p 80:80 frontend
+#   worker: docker run -d backend
