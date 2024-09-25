@@ -100,7 +100,7 @@ app = FastAPI()
 
 # Enable CORS
 origins = [
-    "https://intelligent-study-buddy-674a4384987e.herokuapp.com",
+    "https://intelligent-study-buddy.web.app/",
     "http://127.0.0.1:8000",  # Add other origins as needed
     "*"
 ]
