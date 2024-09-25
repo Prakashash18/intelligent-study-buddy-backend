@@ -1,66 +1,68 @@
-import time
 from fastapi import FastAPI, File, UploadFile, Response, Path, Body, Depends, HTTPException, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain_community.embeddings import OpenAIEmbeddings
+# from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import shutil  # Import the shutil module
 
 # from langchain.vectorstores import FAISS
-from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List
 import os
 import dotenv
 # from langchain.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain, create_history_aware_retriever
 from langchain_openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain_community.vectorstores import Chroma
 
-from langchain.output_parsers import ResponseSchema, StructuredOutputParser
-
 from pydantic import BaseModel
 
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import MessagesPlaceholder
 
-from langchain.schema.output_parser import StrOutputParser
 
 from typing import Dict
 
-from langchain_core.runnables import RunnablePassthrough
 
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredPowerPointLoader, WebBaseLoader
-from datetime import datetime
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredPowerPointLoader
+# from datetime import datetime
+import datetime
 
-from langchain.docstore.document import Document
 
 from langchain.tools import DuckDuckGoSearchResults, YouTubeSearchTool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.agents import AgentExecutor, create_tool_calling_agent, create_react_agent, load_tools, initialize_agent, AgentType
 import ast  # Import the ast module
 import re
 
 from langchain.tools.retriever import create_retriever_tool
-from langchain_core.pydantic_v1 import BaseModel, Field, validator
+from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.agents import AgentActionMessageLog, AgentFinish
 
-from langchain.agents import AgentType, initialize_agent, load_tools, Tool
+from langchain.agents import Tool
 
 from pydantic import BaseModel
 
 import firebase_admin
-from firebase_admin import credentials, auth
+from firebase_admin import credentials, auth, firestore, storage
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
 import asyncio  # Add this import statement
+import tempfile
+
+from langchain_groq import ChatGroq
+
+# from langgraph.graph import StateGraph, MessagesState, START, END
+# from langgraph.checkpoint.memory import MemorySaver
+# from langchain_core.tools import tool
+# # from langchain_anthropic import ChatAnthropic
+# from typing import Annotated, Literal, TypedDict
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -84,7 +86,13 @@ except json.JSONDecodeError as e:
 
 # Initialize Firebase Admin SDK
 cred = credentials.Certificate(firebase_credentials)
-firebase_admin.initialize_app(cred)
+firebase_admin.initialize_app(cred, {
+    'storageBucket': 'intelligent-study-buddy.appspot.com'
+})
+
+
+# Initialize Firestore
+db = firestore.client()
 
 dotenv.load_dotenv()
 
@@ -110,7 +118,7 @@ security = HTTPBearer()
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         decoded_token = auth.verify_id_token(credentials.credentials)
-        print(f"Decoded token: {decoded_token}")  # Add this line for logging
+        # print(f"Decoded token: {decoded_token}")  # Add this line for logging
         return decoded_token
     except Exception as e:
         print(f"Authentication error: {e}")  # Add this line for logging
@@ -131,10 +139,14 @@ class ExplanationRequest(BaseModel):
     options: List[str]
     correctAnswer: str
 
+
 # Set up OpenAI API key
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")  
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
 os.environ['GEMINI_API_KEY'] = os.getenv("GEMINI_API_KEY")
+
+os.environ['GROQ_API_KEY'] = os.getenv('GROQ_API_KEY')
+
 
 # Set up embeddings
 embeddings = OpenAIEmbeddings()
@@ -153,8 +165,16 @@ llm_gemini = ChatGoogleGenerativeAI(
 )
 
 
+llm_llama = ChatGroq(
+            groq_api_key=os.environ['GROQ_API_KEY'],
+            model_name='llama-3.1-70b-versatile',
+            temperature=0
+    )
+
+
 # Set up memory for conversation history
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+
 
 # Set up text splitter
 # text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -167,8 +187,6 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 
-# Store for vectorstores
-vectorstores = {}
 
 @app.post("/upload_file")
 async def upload_file(file: UploadFile = File(...), user=Depends(get_current_user)):
@@ -182,83 +200,100 @@ async def upload_file(file: UploadFile = File(...), user=Depends(get_current_use
         A message indicating successful upload and storage.
     """
     user_id = user['uid']
-    user_upload_dir = f"uploads/{user_id}"
-    os.makedirs(user_upload_dir, exist_ok=True)
-    file_path = f"{user_upload_dir}/{file.filename}"
-    
-    # Check if the file already exists
-    if os.path.exists(file_path):
-        return JSONResponse(content={"message": "File already exists"}, status_code=400)
-    
 
-    with open(file_path, "wb") as f:
-        f.write(file.file.read())
+    # Check if the file already exists in Firestore
+    doc_ref = db.collection('files').document(user_id)  # Use user_id as the document ID
+    doc_ref.set({}, merge=True)  # Create the document if it doesn't exist
+    user_files = doc_ref.get().to_dict() or {}  # Get existing files or initialize an empty dict
+
+    if file.filename in user_files:
+        return JSONResponse(content={"message": "File already exists"}, status_code=400)
+
+    # Upload the file to Firebase Storage
+    bucket = storage.bucket()  # Get the default bucket
+    blob = bucket.blob(f"uploads/{user_id}/{file.filename}")
+    blob.upload_from_file(file.file, content_type=file.content_type)
+
+
+    print("Started Uploading")
 
     # Extract text from the file
     try:
+        # Create a temporary file to store the PDF
+        temp_file_path = ""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            # Download the blob content to the temporary file
+            blob.download_to_filename(temp_file.name)
+            temp_file_path = temp_file.name  # Get the temporary file path
+    
         if file.filename.endswith(".pdf"):
-            loader = PyPDFLoader(file_path)
+            loader = PyPDFLoader(temp_file_path)
         elif file.filename.endswith((".docx", ".doc")):
-            loader = Docx2txtLoader(file_path)
+            loader = Docx2txtLoader(temp_file_path)
         elif file.filename.endswith((".pptx", ".ppt")):
-            loader = UnstructuredPowerPointLoader(file_path)
+            loader = UnstructuredPowerPointLoader(temp_file_path)
         else:
             return {"message": "Unsupported file type"}
+        
         documents = loader.load()
         if not documents:
             return {"message": "No text extracted from the file"}
         print("Extracted documents:", documents)
     except Exception as e:
+        print("Error loading file", e)
         return {"message": f"Error loading file: {e}"}
-    
+
     try:
         # Split the text into chunks
         texts = text_splitter.split_documents(documents)
+        # print("Trying to get docs", texts)
         if not texts:
             return {"message": "No text chunks created from the file"}
 
         print("Text chunks created:", texts)
 
         # Get upload datetime and file size
-        upload_datetime = datetime.now().isoformat()
-        file_size = os.path.getsize(file_path)
+        upload_datetime = datetime.datetime.now().isoformat()
+        file_size = blob.size  # Get size from the blob
 
-        # Check if the persist_directory exists
-        persist_dir = f"chroma_db/{user_id}/{file.filename}"
-        if os.path.exists(persist_dir):
-            # Handle the existing directory
-            # Option 1: Delete the existing directory
-            shutil.rmtree(persist_dir)
-        
+
+        chroma_persist_directory_path = f'chroma_db/{user_id}/{file.filename}'
+
         # Create a new vectorstore for this file
         file_vectorstore = Chroma.from_texts(
             [text.page_content for text in texts if text.page_content is not None],
             embeddings,
-            persist_directory=persist_dir,
-            metadatas=[{"page_number": text.metadata.get("page", None)+1} for text in texts if text.page_content is not None]  # Correct metadata format
+            persist_directory=chroma_persist_directory_path,
+            metadatas=[{"page_number": text.metadata.get("page", None)+1} for text in texts if text.page_content is not None]
         )
 
-    
-        # Store the vectorstore in the dictionary
-        vectorstores[file.filename] = file_vectorstore
+        # Upload each file in the directory to GCS
+        for root, _, files in os.walk(chroma_persist_directory_path):
+            for file_name in files:
+                local_path = os.path.join(root, file_name)
+                blob_name = os.path.relpath(local_path, chroma_persist_directory_path)
+                blob = bucket.blob(f'chroma_db/{user_id}/{file.filename}/{blob_name}')
+                blob.upload_from_filename(local_path)
 
-        # Add datetime and size as properties to the vectorstore
+        print("Vectorstore uploaded to Firebase Storage")
+
+        # Store the vectorstore and metadata in Firestore
         metadata = {
+            "filename": file.filename,  # Add filename as a field
             "upload_datetime": upload_datetime,
-            "file_size": file_size
+            "file_size": file_size,
         }
 
-        print("test")
-        # Save the metadata to a JSON file
-        metadata_path = os.path.join(persist_dir, "metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f)
+        user_files[file.filename] = metadata  # Add metadata to user's files
+
+        print(user_files, "Prakash testing")
+        doc_ref.set(user_files)  # Save all user files to Firestore
 
         # Save the metadata to the Chroma database
         file_vectorstore.persist()
-        print("test 2")
 
     except Exception as e:
+        print(e, "error vectoring")
         return {"vectoring": f"Error vectoring file: {e}"}
 
     # Fetch the updated list of files
@@ -270,7 +305,7 @@ async def upload_file(file: UploadFile = File(...), user=Depends(get_current_use
 @app.get("/files")
 async def fetch_files(user: dict = Depends(get_current_user)):
     """
-    Fetches the list of uploaded files for the user.
+    Fetches the list of uploaded files for the user from Firestore.
 
     Args:
         user: The authenticated user.
@@ -279,18 +314,20 @@ async def fetch_files(user: dict = Depends(get_current_user)):
         A list of uploaded files.
     """
     user_id = user['uid']
-    print("hi", user_id)
-    user_upload_dir = f"uploads/{user_id}"
-    if not os.path.exists(user_upload_dir):
-        return []
+    
+    # Fetch the user's files from Firestore
+    doc_ref = db.collection('files').document(user_id)
+    user_files = doc_ref.get().to_dict() or {}
 
     files = []
-    for file_name in os.listdir(user_upload_dir):
-        file_path = os.path.join(user_upload_dir, file_name)
-        if os.path.isfile(file_path):
-            file_size = os.path.getsize(file_path)
-            files.append({"file_name": file_name, "file_size": file_size})
-    print(files)
+    for file_name, metadata in user_files.items():
+        files.append({
+            "file_name": file_name,
+            "file_size": metadata.get("file_size"),
+            "upload_datetime": metadata.get("upload_datetime")
+        })
+    
+    # print(files)
     return files
 
 
@@ -314,22 +351,22 @@ async def search_file(file_name: str, query: str):
         return {"message": f"File '{file_name}' not found."}
 
 
-@app.on_event("startup")
-async def startup_event():
-    """
-    Loads vectorstores from persistent storage on startup.
-    """
-    for user_id in os.listdir("chroma_db"):
-        user_dir = os.path.join("chroma_db", user_id)
-        if os.path.isdir(user_dir):
-            for filename in os.listdir(user_dir):
-                if filename != ".DS_Store":
-                    persist_directory = f"chroma_db/{user_id}/{filename}"
-                    if os.path.exists(persist_directory):
-                        if os.path.exists(persist_directory) and not os.path.isdir(persist_directory):
-                            os.remove(persist_directory)  # Remove the file if it's not a directory
-                        file_vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-                        vectorstores[filename] = file_vectorstore
+# @app.on_event("startup")
+# async def startup_event():
+#     """
+#     Loads vectorstores from persistent storage on startup.
+#     """
+#     for user_id in os.listdir("chroma_db"):
+#         user_dir = os.path.join("chroma_db", user_id)
+#         if os.path.isdir(user_dir):
+#             for filename in os.listdir(user_dir):
+#                 if filename != ".DS_Store":
+#                     persist_directory = f"chroma_db/{user_id}/{filename}"
+#                     if os.path.exists(persist_directory):
+#                         if os.path.exists(persist_directory) and not os.path.isdir(persist_directory):
+#                             os.remove(persist_directory)  # Remove the file if it's not a directory
+#                         file_vectorstore = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+#                         vectorstores[filename] = file_vectorstore
 
 
 @app.delete("/delete/{file_name}")
@@ -348,27 +385,39 @@ async def delete_file(file_name: str, user=Depends(get_current_user)):
     file_path = os.path.join(user_upload_dir, file_name)
     db_dir = f"chroma_db/{user_id}/{file_name}"
 
-    if file_name in vectorstores:
-        # Remove the vectorstore from the dictionary
-        del vectorstores[file_name]
+    # # Delete the vectorstore from the dictionary
+    # if file_name in vectorstores:
+    #     del vectorstores[file_name]
 
     # Delete the Chroma database directory
     if os.path.exists(db_dir):
         shutil.rmtree(db_dir)
-    
-    # Delete the uploaded file
-    if os.path.exists(file_path):
-        os.remove(file_path)
 
-        return {"message": f"File '{file_name}' deleted successfully."}
-    else:
-        return {"message": f"File '{file_name}' not found."}
+    # Delete the uploaded file from Firebase Storage
+    bucket = storage.bucket()
+    blob = bucket.blob(f"uploads/{user_id}/{file_name}")
+    if blob.exists():
+        blob.delete()
+
+    # Delete the Chroma files from Firebase Storage
+    chroma_blobs = bucket.list_blobs(prefix=f'chroma_db/{user_id}/{file_name}/')
+    for chroma_blob in chroma_blobs:
+        chroma_blob.delete()
+
+    # Delete the metadata from Firestore
+    doc_ref = db.collection('files').document(user_id)
+    user_files = doc_ref.get().to_dict() or {}
+    if file_name in user_files:
+        del user_files[file_name]
+        doc_ref.set(user_files)
+
+    return {"message": f"File '{file_name}' deleted successfully."}
 
 
 @app.get("/download/{file_name}")
 async def download_file(file_name: str, user=Depends(get_current_user)):
     """
-    Downloads a file by its filename.
+    Downloads a file by its filename from Firebase Storage.
 
     Args:
         file_name: The name of the file to download.
@@ -377,41 +426,32 @@ async def download_file(file_name: str, user=Depends(get_current_user)):
         The file content as a response.
     """
     user_id = user['uid']
-    user_upload_dir = f"uploads/{user_id}"
-    file_path = os.path.join(user_upload_dir, file_name)
+    blob_path = f"uploads/{user_id}/{file_name}"
+    bucket = storage.bucket()
 
-    # Debugging statement to log the file path
-    print(f"Attempting to download file from path: {file_path}")
+    # Debugging statement to log the blob path
+    print(f"Attempting to download file from Firebase Storage path: {blob_path}")
 
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        with open(file_path, "rb") as f:
-            file_content = f.read()
+    blob = bucket.blob(blob_path)
+
+    if blob.exists():
+        file_content = blob.download_as_bytes()
         return Response(content=file_content, media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename={file_name}"})
     else:
-        return {"message": f"File '{file_name}' not found or is a directory."}
+        return {"message": f"File '{file_name}' not found in Firebase Storage."}
 
 
 # Define a generator function to stream responses
 async def gemini_response_generator(filename, question, chat_history, user: str):
-    
     user_id = user['uid']
     persist_directory = f"chroma_db/{user_id}/{filename}"
     
     # Debugging statements to log inputs
     print(f"Filename: {filename}, Question: {question}, Chat History: {chat_history}")
     
-    # Check if the persist directory exists and is a directory
-    if os.path.exists(persist_directory):
-        if not os.path.isdir(persist_directory):
-            print(f"Error: {persist_directory} is not a directory.")
-            os.remove(persist_directory)  # Remove the file if it's not a directory
-            os.makedirs(persist_directory, exist_ok=True)
-    else:
-        os.makedirs(persist_directory, exist_ok=True)
-    
-    # Load the vectorstore from ChromaDB
+    # Load the vectorstore from Firebase Storage
     try:
-        vectorstore = Chroma(persist_directory=persist_directory, embedding_function=OpenAIEmbeddings())
+        vectorstore = await load_chroma_vectorstore_from_firebase(user_id, filename, persist_directory)
     except Exception as e:
         print(f"Error initializing Chroma vectorstore: {e}")
         raise HTTPException(status_code=500, detail=f"Error initializing Chroma vectorstore: {e}")
@@ -447,7 +487,7 @@ async def gemini_response_generator(filename, question, chat_history, user: str)
     print(chat_history_messages)
 
     # Create a tool from the retriever
-    retriever_tool = create_retriever_tool(retriever, "retrieve_from_notes", "Retrieve relevant information from the document.")
+    retriever_tool = create_retriever_tool(retriever, "retrieve_from_notes", "Retrieve relevant information from the document for given user question")
 
     search_tool = DuckDuckGoSearchResults(max_results=3)
 
@@ -540,12 +580,298 @@ async def gemini_response_generator(filename, question, chat_history, user: str)
             "filename": filename
         }
     
-    save_chat_history(chat_history) 
+    save_chat_history(chat_history)
 
     print(result)
 
     # Return the result
     return result
+
+
+async def llama_response_generator(filename, question, chat_history, user: str):
+    user_id = user['uid']
+    persist_directory = f"chroma_db/{user_id}/{filename}"
+    
+    # Debugging statements to log inputs
+    print(f"Filename: {filename}, Question: {question}, Chat History: {chat_history}")
+    
+    # Load the vectorstore from Firebase Storage
+    try:
+        vectorstore = await load_chroma_vectorstore_from_firebase(user_id, filename, persist_directory)
+    except Exception as e:
+        print(f"Error initializing Chroma vectorstore: {e}")
+        raise HTTPException(status_code=500, detail=f"Error initializing Chroma vectorstore: {e}")
+    
+    # k is the number of chunks to retrieve
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+
+    # Use the retriever to search for relevant documents
+    relevant_docs = retriever.get_relevant_documents(question)
+
+    # Check if relevant documents were found
+    if not relevant_docs:
+        print("No relevant documents found.")
+        return JSONResponse(content={"message": "No relevant documents found."})
+
+    # Output the relevant documents
+    print("Relevant documents:")
+    for doc in relevant_docs:
+        print(f"Content: {doc.page_content}")
+
+    # Convert chat_history to a list of HumanMessage and AIMessage objects
+    chat_history_messages = []
+    for item in chat_history:
+        content = str(item["content"])  # Ensure content is a string
+        if item["role"] == "user":
+            chat_history_messages.append(HumanMessage(content=content, role=item["role"]))
+        else:
+            chat_history_messages.append(AIMessage(content=content, role=item["role"]))
+
+    chat_history_messages.append(HumanMessage(content=question, role="user"))
+
+    print("Chat history messages:")
+    print(chat_history_messages)
+
+    # Create a tool from the retriever
+    retriever_tool = create_retriever_tool(retriever, "retrieve_from_notes", "Retrieve relevant information from the notes for the given question. Always use tool")
+
+    search_tool = DuckDuckGoSearchResults(max_results=3)
+
+    # tools = load_tools([retriever_tool, search_tool], llm=llm_llama)
+    # agent = initialize_agent(tools, llm, agent="zero-shot-react-description", verbose=True)
+
+
+    # Create agent
+    tools = [
+        Tool(
+            name="retrieve_from_notes",
+            func=retriever_tool,
+            description="Retrieve relevant information from the notes for the given question. Always use tool"
+        ),
+        # Tool(
+        #     name="search_tool",
+        #     func=search_tool,
+        #     description="Search for relevant information on the internet for the given question based on the results from 'retrieve_from_notes' tool."
+        # ),
+    ]
+
+    # Define the tools for the agent
+    # tools = [retriever_tool, search_tool]
+
+    # llm_llama.bind_tools(tools)
+
+    # Prompt for creating Tool Calling Agent
+    # prompt = ChatPromptTemplate.from_messages(
+    #     [
+    #         (
+    #             "system",
+    #             """
+    #             Answer the following questions as best you can. You have access to the following tools:
+
+    #             {tools}
+
+    #             Use the following format:
+
+    #             Question: the input question you must answer
+    #             Thought: you should always think about what to do
+    #             Action: the action to take, should be one of [{tool_names}]
+    #             Action Input: the input to the action
+    #             Observation: the result of the action
+    #             ... (this Thought/Action/Action Input/Observation can repeat N times)
+    #             Thought: I now know the final answer
+    #             Final Answer: the final answer to the original input question
+
+    #             You are a helpful teacher, very friendly. Keep your responses short. 
+    #             Use emojis in your replies. 
+    #             You have access to a tool called 'retrieve_from_notes' which can retrieve relevant information from the notes the student uploaded.
+    #             Always use retrieve_from_notes first.
+    #             If students need more explanations on notes, you can used the search_tool to search the and present an answer.
+    #             If question not related to notes, remind student to ask from notes.
+    #             Strictly answer questions in the notes context.
+    #             Empty responses strictly not allowed.
+
+    #             """,
+    #         ),
+    #         ("human", "{input}"),
+    #         MessagesPlaceholder("chat_history"),
+    #         ("placeholder", "{agent_scratchpad}"),
+    #     ]
+    # )
+
+    template = """
+                You are a helpful and friendly teacher. Keep your responses short and use emojis in your replies. 
+                You have access to the following tools: {tools}. Always use the 'retrieve_from_notes' tool first to find relevant information from the notes. 
+                If the question is not related to the notes, remind the student to ask from the notes. Strictly answer questions in the notes context. 
+                Empty responses are strictly not allowed.
+
+         
+                Begin!
+
+                Question: {input}
+                Thought: {agent_scratchpad}
+                Action: The action to take, should be one of [{tool_names}]
+                Chat History: {chat_history}
+                """
+
+    # Create a PromptTemplate object
+    react_prompt_template = PromptTemplate(
+        input_variables=["chat_history", "question", "tools"],
+        template=template
+    )
+
+    # # Create the agent
+    # agent = create_tool_calling_agent(llm_llama, tools, prompt)
+
+    # react_agent = initialize_agent(
+    #     agent_type=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
+    #     llm=llm_llama,
+    #     tools=tools,
+    #     prompt_template=react_prompt_template,
+    #     verbose=True,
+    # )
+
+    # Convert chat history to a string representation
+    chat_history_text = "\n".join([f"User: {msg.content}" if isinstance(msg, HumanMessage) 
+                                   else f"AI: {msg.content}" for msg in chat_history_messages])
+
+    tools_description = ", ".join([tool.name for tool in tools])
+
+    # # Run the agent using the chat history and question
+    # response = react_agent.run({
+    #     "chat_history": chat_history_text,
+    #     "question": question,
+    #     "input": question,
+    #     "tools": tools_description
+    # })
+
+    agent = create_react_agent(llm_llama, tools, react_prompt_template)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=4)
+
+    response = agent_executor.invoke({
+        "chat_history": chat_history_text,
+        "question": question,
+        "input": question,
+        "tools": tools_description
+        
+        })
+
+    # # Define the AgentExecutor
+    # agent_executor = AgentExecutor(agent=search_executor,
+    #                                tools=tools,
+    #                                verbose=True,
+    #                                return_intermediate_steps=True)
+    
+    # # ... existing code ...
+    # agent_scratchpad = []  # Ensure this is a list
+    # result = agent_executor.invoke({
+    #     "input": question,
+    #     "chat_history": chat_history_messages,
+    #     "agent_scratchpad": agent_scratchpad  # Pass as a list
+    # })
+    # ... existing code ...
+
+    # result = agent_executor.invoke({
+    #     "input": question,
+    #     "chat_history": chat_history_messages,
+    # })
+
+
+
+    # # Define the AgentExecutor
+    # agent_executor = AgentExecutor(agent=agent,
+    #                                tools=tools,
+    #                                prompt=prompt,
+    #                                verbose=True,
+    #                                return_intermediate_steps=True)
+
+    # # Run the agent and capture the result
+    # result = agent_executor.invoke({
+    #     "input": question,
+    #     "chat_history": chat_history_messages,
+    # })
+
+    result['output'] = response
+
+    # Log the result
+    print("Agent result:", result)
+
+    # Check if the result is empty or not in expected format
+    if not result or 'output' not in result:
+        print("Llama produced an empty response.")
+        return JSONResponse(content={"message": "Llama produced an empty response."})
+
+    print("Check out the result", result)
+
+    # Check if intermediate_steps list is empty
+    if not result['intermediate_steps']:
+        print("The agent did not use any tools.")
+        result['context'] = []
+    else:
+        print("The agent used the following tools:")
+        # Clean up the context
+        cleaned_contexts = []
+
+        for doc in relevant_docs:
+            print(doc)
+            cleaned_content = clean_up_document_content(doc.page_content)
+            cleaned_contexts.append({"page_content": cleaned_content, "page_number": doc.metadata.get("page_number", None)})
+
+        result['context'] = cleaned_contexts
+    
+    del result['intermediate_steps']
+    del result['chat_history']
+
+    chat_history = {
+            "role": "user",
+            "content": question,
+            "user_id": user['uid'],
+            "filename": filename
+        }
+        
+    save_chat_history(chat_history)
+
+    chat_history = {
+            "role": "ai",
+            "content": result['output'],
+            "user_id": user['uid'],
+            "filename": filename
+        }
+    
+    save_chat_history(chat_history)
+
+    print(result)
+
+    # Return the result
+    return result
+
+
+async def load_chroma_vectorstore_from_firebase(user_id: str, filename: str, persist_directory: str):
+    """
+    Loads the Chroma vectorstore from Firebase Storage.
+
+    Args:
+        user_id: The user ID.
+        filename: The name of the file.
+        persist_directory: The local directory to store the vectorstore.
+
+    Returns:
+        The loaded Chroma vectorstore.
+    """
+    bucket = storage.bucket()
+    blobs = bucket.list_blobs(prefix=f'chroma_db/{user_id}/{filename}/')
+
+    # Ensure the persist directory exists
+    os.makedirs(persist_directory, exist_ok=True)
+
+    # Download each file in the directory from GCS
+    for blob in blobs:
+        local_path = os.path.join(persist_directory, os.path.relpath(blob.name, f'chroma_db/{user_id}/{filename}'))
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        blob.download_to_filename(local_path)
+
+    # Load the vectorstore from the local directory
+    vectorstore = Chroma(persist_directory=persist_directory, embedding_function=OpenAIEmbeddings())
+    return vectorstore
 
 
 @app.post("/ask/{file_name}")
@@ -566,12 +892,11 @@ async def ask_question(file_name: str = Path(..., description="The name of the f
 
     question = request.question
     print("hey", file_name, question, chat_history)
-    if file_name in vectorstores:
         # Directly call the generator function and collect the result
-        result = await gemini_response_generator(file_name, question, chat_history, user)
-        return JSONResponse(content=result, media_type='application/json; charset=utf-8')
-    else:
-        return {"message": f"File '{file_name}' not found."}
+    result = await gemini_response_generator(file_name, question, chat_history, user)
+    # result = await llama_response_generator(file_name, question, chat_history, user)
+    return JSONResponse(content=result, media_type='application/json; charset=utf-8')
+
 
 
 def parse_retriever_input(params: Dict):
@@ -642,7 +967,7 @@ async def conversation_q_and_a(filename, question, chat_history, user):
     print(chat_history_messages)
 
     # Create a tool from the retriever
-    retriever_tool = create_retriever_tool(retriever, "retrieve_from_notes", "Retrieve relevant information from the document.")
+    retriever_tool = create_retriever_tool(retriever, "retrieve_from_notes", "Retrieve relevant information from the uploaded document based on input: {input}.")
 
     search_tool = DuckDuckGoSearchResults(max_results=3)
 
@@ -672,7 +997,18 @@ async def conversation_q_and_a(filename, question, chat_history, user):
     agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, return_intermediate_steps=True)
 
     # Run Agent
-    result = agent_executor.invoke({"input": question, "chat_history": chat_history_messages,})
+    result = agent_executor.invoke({
+        "input": question,
+        "chat_history": chat_history_messages,
+        "tool_calls": [
+            {
+                "id": "pending",
+                "type": "function",
+                "function": {"name": "retrieve_from_notes"},
+                "parameters": {}
+            }
+        ]
+    })
 
     # Check if intermediate_steps list is empty
     if not result['intermediate_steps']:
@@ -795,6 +1131,7 @@ async def video_search(query: VideoRequest, user=Depends(get_current_user)):
     Returns:
         A list of video links.
     """
+    print("Hi Prakash")
     youtube_search = YouTubeSearchTool()
     try:
         video_links = youtube_search.run(query.query)
@@ -803,6 +1140,7 @@ async def video_search(query: VideoRequest, user=Depends(get_current_user)):
     except ValueError as e:
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception as e:
+        print(e)
         return JSONResponse(content={"error": "An unexpected error occurred."}, status_code=500)
 
 class MCQRequest(BaseModel):
@@ -822,6 +1160,7 @@ class MCQList(BaseModel):
 
 
 from fastapi.logger import logger
+
 
 @app.post("/generate-mcqs")
 def generate_mcqs_endpoint(request: MCQRequest, user=Depends(get_current_user)):
@@ -910,15 +1249,15 @@ def generate_explanation_with_llm(question, options, correct_answer, user):
     return response.content
 
 def load_chat_history(user_id: str, file_name: str):
-    user_chat_history_dir = f"chat_history/{user_id}"
-    chat_history_file = f"{user_chat_history_dir}/{file_name}.json"
-    
-    # Load existing chat history if available
-    if os.path.exists(chat_history_file):
-        with open(chat_history_file, "r") as f:
-            chat_history = json.load(f)
-            return chat_history[-10:]  # Limit to the last 10 messages
+    # Load existing chat history from Firestore
+    doc_ref = db.collection('chat_history').document(user_id).collection('files').document(file_name)
+    doc = doc_ref.get()
+    if doc.exists:
+        chat_history = doc.to_dict().get('history', [])
+        return chat_history[-10:]  # Limit to the last 10 messages
     else:
+        # Create an empty chat history if it doesn't exist
+        doc_ref.set({'history': []})
         return []
 
 @app.get("/chat_history/{file_name}")
@@ -938,19 +1277,17 @@ async def load_chat_history_endpoint(file_name: str, user=Depends(get_current_us
 
 def save_chat_history(chat_history):
     user_id = chat_history['user_id']  # Assuming user_id is part of chat_history
-    user_chat_history_dir = f"chat_history/{user_id}"
-    os.makedirs(user_chat_history_dir, exist_ok=True)
-    chat_history_file = f"{user_chat_history_dir}/{chat_history['filename']}.json"
+    file_name = chat_history['filename']
     
-    # Load existing chat history if it exists
-    if os.path.exists(chat_history_file):
-        with open(chat_history_file, "r") as f:
-            existing_history = json.load(f)
+    # Load existing chat history from Firestore
+    doc_ref = db.collection('chat_history').document(user_id).collection('files').document(file_name)
+    doc = doc_ref.get()
+    if doc.exists:
+        existing_history = doc.to_dict().get('history', [])
     else:
-        existing_history = []  # Initialize as empty if file does not exist
+        existing_history = []  # Initialize as empty if document does not exist
 
     existing_history.append(chat_history)  # Append new chat history
 
-    with open(chat_history_file, "w") as f:
-        json.dump(existing_history, f)  # Save the updated history
-
+    # Save the updated history to Firestore
+    doc_ref.set({'history': existing_history})
